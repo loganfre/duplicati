@@ -30,14 +30,9 @@ namespace Duplicati.GUI.TrayIcon
         
         private static string GetDefaultToolKit(bool printwarnings)
         {
-            
+            // No longer using Cocoa directly as it fails on 32bit as well            
             if (Duplicati.Library.Utility.Utility.IsClientOSX)
-            {
-                if (Environment.Is64BitProcess)
                     return TOOLKIT_RUMPS;
-                else
-                    return TOOLKIT_COCOA;
-            }
 
 #if __MonoCS__ || __WindowsGTK__            
             if (Duplicati.Library.Utility.Utility.IsClientLinux)
@@ -220,7 +215,7 @@ namespace Duplicati.GUI.TrayIcon
             else if (toolkit == TOOLKIT_RUMPS)
                 return GetRumpsRunnerInstance();
             else 
-                throw new Exception(string.Format("The selected toolkit '{0}' is invalid", toolkit));
+                throw new UserInformationException(string.Format("The selected toolkit '{0}' is invalid", toolkit));
         }
         
         //We keep these in functions to avoid attempting to load the instance,

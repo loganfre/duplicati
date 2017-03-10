@@ -4,8 +4,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Mail;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 using DnsLib;
@@ -13,6 +11,9 @@ using Duplicati.Library.Interface;
 using Duplicati.Library.Logging;
 using Duplicati.Library.Utility;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using MailKit.Net.Smtp;
+using MimeKit;
 
 namespace Duplicati.Library.Modules.Builtin
 {
@@ -67,7 +68,7 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// The default mail level
         /// </summary>
-        private const MailLevels DEFAULT_LEVEL = MailLevels.All;
+        private const string DEFAULT_LEVEL = "all";
         /// <summary>
         /// The default mail body
         /// </summary>
@@ -78,20 +79,7 @@ namespace Duplicati.Library.Modules.Builtin
         private const string DEFAULT_SENDER = "no-reply";
         #endregion
 
-        /// <summary>
-        /// The allowed mail levels
-        /// </summary>
-        [Flags]
-        private enum MailLevels
-        {
-            Success = 0x1,
-            Warning = 0x2,
-            Error = 0x4,
-            All = Success | Warning | Error
-        }
-
         #region Private variables
-
         /// <summary>
         /// The cached name of the operation
         /// </summary>
@@ -144,7 +132,7 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// The mail send level
         /// </summary>
-        private MailLevels m_level;
+        private string[] m_levels;
         /// <summary>
         /// True to send all operations
         /// </summary>
@@ -192,7 +180,7 @@ namespace Duplicati.Library.Modules.Builtin
                     new CommandLineArgument(OPTION_SERVER, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionServerShort, Strings.SendMail.OptionServerLong),
                     new CommandLineArgument(OPTION_USERNAME, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionUsernameShort, Strings.SendMail.OptionUsernameLong),
                     new CommandLineArgument(OPTION_PASSWORD, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionPasswordShort, Strings.SendMail.OptionPasswordLong),
-                    new CommandLineArgument(OPTION_SENDLEVEL, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSendlevelShort, Strings.SendMail.OptionSendlevelLong(MailLevels.Success.ToString(), MailLevels.Warning.ToString(), MailLevels.Error.ToString(), MailLevels.All.ToString()), DEFAULT_LEVEL.ToString(), null, Enum.GetNames(typeof(MailLevels))),
+                    new CommandLineArgument(OPTION_SENDLEVEL, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSendlevelShort, Strings.SendMail.OptionSendlevelLong(ParsedResultType.Success.ToString(), ParsedResultType.Warning.ToString(), ParsedResultType.Error.ToString(), ParsedResultType.Fatal.ToString(), "All"), DEFAULT_LEVEL, null, Enum.GetNames(typeof(ParsedResultType)).Union(new string [] { "All" }).ToArray()),
                     new CommandLineArgument(OPTION_SENDALL, CommandLineArgument.ArgumentType.Boolean, Strings.SendMail.OptionSendallShort, Strings.SendMail.OptionSendallLong),
                 });
             }
@@ -217,24 +205,24 @@ namespace Duplicati.Library.Modules.Builtin
             commandlineOptions.TryGetValue(OPTION_BODY, out m_body);
             m_options = commandlineOptions;
 
-            m_level = 0;
-
             string tmp;
             commandlineOptions.TryGetValue(OPTION_SENDLEVEL, out tmp);
             if (!string.IsNullOrEmpty(tmp))
-                foreach(var s in tmp.Split(new string[] {","}, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    if (string.IsNullOrEmpty(s))
-                        continue;
+                m_levels = 
+                    tmp
+                    .Split(new string[] { "," }, StringSplitOptions.RemoveEmptyEntries)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Select(x => x.Trim())
+                    .ToArray();
 
-                    MailLevels m;
-                    if (Enum.TryParse(s.Trim(), true, out m))
-                        m_level |= m;
-                }
-
-            if (m_level == 0)
-                m_level = DEFAULT_LEVEL;
-
+            if (m_levels == null || m_levels.Length == 0)
+                m_levels = 
+                    DEFAULT_LEVEL
+                    .Split(new string[] { "," }, StringSplitOptions.RemoveEmptyEntries)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Select(x => x.Trim())
+                    .ToArray();
+                   
             m_sendAll = Utility.Utility.ParseBoolOption(commandlineOptions, OPTION_SENDALL);
 
             if (string.IsNullOrEmpty(m_subject))
@@ -278,20 +266,20 @@ namespace Duplicati.Library.Modules.Builtin
 
             if (string.Equals(m_operationname, "Backup", StringComparison.InvariantCultureIgnoreCase))
             {
-                MailLevels level;
+                ParsedResultType level;
                 if (result is Exception)
-                    level = MailLevels.Error;
-                else if (result != null && result is Library.Interface.IBackupResults && (result as Library.Interface.IBackupResults).Errors.Count() > 0)
-                    level = MailLevels.Warning;
+                    level = ParsedResultType.Fatal;
+                else if (result != null && result is Library.Interface.IBasicResults)
+                    level = ((IBasicResults)result).ParsedResult;
                 else
-                    level = MailLevels.Success;
+                    level = ParsedResultType.Error;
                 
                 m_parsedresultlevel = level.ToString();
 
-                if (m_level != MailLevels.All)
+                if (!m_levels.Any(x => string.Equals(x, "all", StringComparison.OrdinalIgnoreCase)))
                 {
                     //Check if this level should send mail
-                    if ((m_level & level) == 0)
+                    if (!m_levels.Any(x => string.Equals(x, level.ToString(), StringComparison.OrdinalIgnoreCase)))
                         return;
                 }
             }
@@ -300,29 +288,35 @@ namespace Duplicati.Library.Modules.Builtin
             {
                 string body = m_body;
                 string subject = m_subject;
-                if (body != DEFAULT_BODY && System.IO.File.Exists(body))
+                if (body != DEFAULT_BODY && System.IO.Path.IsPathRooted(body) && System.IO.File.Exists(body))
                     body = System.IO.File.ReadAllText(body);
 
                 body = ReplaceTemplate(body, result, false);
                 subject = ReplaceTemplate(subject, result, true);
 
-                var message = new MailMessage();
-                foreach(string s in m_to.Split(new [] { "," }, StringSplitOptions.RemoveEmptyEntries))
-                    message.To.Add(new MailAddress(s.Replace("\"", "")));
+                var message = new MimeMessage();
+                MailboxAddress mailbox;
+                foreach (string s in m_to.Split(new[] { "," }, StringSplitOptions.RemoveEmptyEntries))
+                    if(MailboxAddress.TryParse(s.Replace("\"", ""), out mailbox))
+                        message.To.Add(mailbox);
 
-                string from = m_from.Trim();
+                var mailboxToFirst = (MailboxAddress) message.To.First();
+                string toMailDomain = mailboxToFirst.Address.Substring(mailboxToFirst.Address.LastIndexOf("@", StringComparison.Ordinal) + 1);
+                                
+                string from = m_from.Trim().Replace("\"", "");
                 if (from.IndexOf('@') < 0)
                 {
-                    if (from.EndsWith(">"))
-                        from = from.Insert(from.Length - 1, "@" + message.To[0].Host);
+                    if (from.EndsWith(">", StringComparison.Ordinal))
+                        from = from.Insert(from.Length - 1, "@" + toMailDomain);
                     else
-                        from = string.Format("No Reply - Backup report <{0}@{1}>", from, message.To[0].Host);
+                        from = string.Format("No Reply - Backup report <{0}@{1}>", from, toMailDomain);
                 }
-                message.From = new MailAddress(from.Replace("\"", ""));
 
+                if (MailboxAddress.TryParse(from, out mailbox))
+                    message.From.Add(mailbox);
+                
                 message.Subject = subject;
-                message.Body = body;
-                message.BodyEncoding = message.SubjectEncoding = Encoding.UTF8;
+                message.Body = new TextPart("plain") { Text = body, ContentTransferEncoding = ContentEncoding.EightBit };
 
                 List<string> servers = null;
                 if (string.IsNullOrEmpty(m_server))
@@ -330,13 +324,13 @@ namespace Duplicati.Library.Modules.Builtin
                     var dnslite = new DnsLib.DnsLite();
                     var dnslist = new List<string>();
 
-                    //Grab all IPv4 adresses
+                    //Grab all IPv4 addresses
                     foreach (NetworkInterface networkInterface in NetworkInterface.GetAllNetworkInterfaces())
                         try 
                         {
-                            foreach (IPAddress dnsAdress in networkInterface.GetIPProperties().DnsAddresses)
-                                if (dnsAdress.AddressFamily == AddressFamily.InterNetwork)
-                                    dnslist.Add(dnsAdress.ToString());
+                            foreach (IPAddress dnsAddress in networkInterface.GetIPProperties().DnsAddresses)
+                                if (dnsAddress.AddressFamily == AddressFamily.InterNetwork)
+                                    dnslist.Add(dnsAddress.ToString());
                         }
                         catch { }
                     
@@ -353,23 +347,25 @@ namespace Duplicati.Library.Modules.Builtin
                         dnslist.Add("208.67.222.222");
                         dnslist.Add("208.67.220.220");
                     }
-                    
-                    var oldStyleList = new ArrayList();
-                    foreach(var s in dnslist)
-                        oldStyleList.Add(s);
-                        
-                    dnslite.setDnsServers(oldStyleList);
 
-                    servers = dnslite.getMXRecords(message.To[0].Host).OfType<MXRecord>().OrderBy(record => record.preference).Select(x => "smtp://" +  x.exchange).Distinct().ToList();
+                    var records = new List<MXRecord>();
+                    foreach (var s in dnslist)
+                    {
+                        var res = dnslite.getMXRecords(toMailDomain, s);
+                        if (res != null)
+                            records.AddRange(res.OfType<MXRecord>());
+                    }
+
+                    servers = records.OrderBy(record => record.preference).Select(x => "smtp://" + x.exchange).Distinct().ToList();
                     if (servers.Count == 0)
                         throw new IOException(Strings.SendMail.FailedToLookupMXServer(OPTION_SERVER));
                 }
                 else 
                 {
                     servers = (from n in m_server.Split(new string[] { ";" }, StringSplitOptions.RemoveEmptyEntries)
-                              let srv = (n == null || n.IndexOf("://", StringComparison.InvariantCultureIgnoreCase) > 0) ? n : "smtp://" + n
-                              where !string.IsNullOrEmpty(srv)
-                              select srv).Distinct().ToList();
+                               let srv = (n == null || n.IndexOf("://", StringComparison.InvariantCultureIgnoreCase) > 0) ? n : "smtp://" + n
+                               where !string.IsNullOrEmpty(srv)
+                               select srv).Distinct().ToList();
                 }
                 
                 Exception lastEx = null;
@@ -383,19 +379,36 @@ namespace Duplicati.Library.Modules.Builtin
                     lastServer = server;
                     try
                     {
-                        var serverUri = new System.Uri(server);
-                        var useTls = string.Equals(serverUri.Scheme, "smtptls", StringComparison.InvariantCultureIgnoreCase) || string.Equals(serverUri.Scheme, "tls", StringComparison.InvariantCultureIgnoreCase);
-                        var port = serverUri.Port <= 0 ? (useTls ? 587 : 25) : serverUri.Port;
-                        var client = new SmtpClient(serverUri.Host, port);
-                        client.Timeout = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
-                        if (!string.IsNullOrEmpty(m_username) && !string.IsNullOrEmpty(m_password))
-                            client.Credentials = new NetworkCredential(m_username, m_password);
+                        using (MemoryStream ms = new MemoryStream())
+                        {
+                            try
+                            {
+                                using (var client = new SmtpClient(new MailKit.ProtocolLogger(ms)))
+                                {
+                                    client.Timeout = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
+
+                                    // Backward compatibility fix for setup prior to using MailKit
+                                    var uri = new System.Uri(server);
+                                    if (uri.Scheme.ToLowerInvariant() == "tls")
+                                        uri = new System.Uri("smtp://" + uri.Host + ":" + (uri.Port <= 0 ? 587 : uri.Port) + "/?starttls=always");
+
+                                    client.Connect(uri);
+
+                                    if (!string.IsNullOrEmpty(m_username) && !string.IsNullOrEmpty(m_password))
+                                        client.Authenticate(m_username, m_password);
+
+                                    client.Send(message);
+                                    client.Disconnect(true);
+                                }
+                            }
+                            finally
+                            {
+                                var log = Encoding.UTF8.GetString(ms.GetBuffer());
+                                if (!string.IsNullOrWhiteSpace(log))
+                                    Logging.Log.WriteMessage(Strings.SendMail.SendMailLog(log), LogMessageType.Profiling);
+                            }
+                        }
                         
-                        //This ensures that you can override settings from an app.config file
-                        if (useTls)
-                            client.EnableSsl = true;
-        
-                        client.Send(message);
                         lastEx = null;
                         Logging.Log.WriteMessage(Strings.SendMail.SendMailSuccess(server), LogMessageType.Information);
                         break;

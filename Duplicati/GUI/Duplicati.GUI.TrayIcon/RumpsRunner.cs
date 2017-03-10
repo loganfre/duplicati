@@ -180,6 +180,9 @@ namespace Duplicati.GUI.TrayIcon
             ReadChannel(m_rumpsProcess.StandardOutput);
             ReadChannel(m_rumpsProcess.StandardError);
 
+            m_toRumps.WriteNoWait(JsonConvert.SerializeObject(new {Action = "background"}));
+            //m_toRumps.WriteNoWait(JsonConvert.SerializeObject(new {Action = "setappicon", Image = GetIcon(m_lastIcon)}));
+
             if (m_menus != null)
             {
                 ResetMenus();

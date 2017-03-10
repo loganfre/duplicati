@@ -85,11 +85,19 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
                 m_delayTimeSpan = new TimeSpan(0);
             else
                 m_delayTimeSpan = Library.Utility.Timeparser.ParseTimeSpan(delay);
+            m_waitUntil = DateTime.Now + m_delayTimeSpan;
 
             m_oauth = new OAuthHelper(authid, this.ProtocolKey) { AutoAuthHeader = true };
             m_userid = authid.Split(new string[] {":"}, StringSplitOptions.RemoveEmptyEntries).First();
         }
-            
+
+        private void EnforceConsistencyDelay()
+        {
+            var wait = m_waitUntil - DateTime.Now;
+            if (wait.Ticks > 0)
+                System.Threading.Thread.Sleep(wait);
+        }
+
         private string CacheFilePath { get { return Path.Combine(Utility.TempFolder.SystemTempPath, string.Format(CACHE_FILE_NAME_TEMPLATE, m_userid)); } }
                 
         private void RefreshMetadataAndContentUrl()
@@ -155,12 +163,15 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
 
         private ResourceModel GetCurrentDirectory(bool createMissing, string altpath = null)
         {
+            EnforceConsistencyDelay();
+
             var rootResponse = m_oauth.GetJSONData<ListResponse>(string.Format("{0}/nodes?filters=isRoot:true", MetadataUrl));
             var parent = rootResponse.Data.First();
             var curpath = new List<string>();
             foreach(var p in (altpath ?? m_path).Split(new string[] {"/"}, StringSplitOptions.RemoveEmptyEntries))
             {
-                var self = m_oauth.GetJSONData<ListResponse>(string.Format("{0}/nodes?filters=kind:{1}%20and%20parents:{2}%20and%20name:{3}", MetadataUrl, CONTENT_KIND_FOLDER, Utility.Uri.UrlEncode(parent.ID), Utility.Uri.UrlEncode(p)));
+                var requestUrl = string.Format("{0}/nodes?filters=kind:{1}%20and%20parents:{2}%20and%20name:{3}", MetadataUrl, CONTENT_KIND_FOLDER, Utility.Uri.UrlEncode(parent.ID), Utility.Uri.UrlPathEncode(EscapeFiltersValue(p)));
+                var self = m_oauth.GetJSONData<ListResponse>(requestUrl);
                 if (self == null || self.Count == 0 || self.Data == null || self.Data.Length == 0)
                 {
                     if (!createMissing)
@@ -192,9 +203,10 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
                                 rs.Write(data, 0, data.Length);
                         }
                     );
+                    m_waitUntil = DateTime.Now + m_delayTimeSpan;
                 }
                 else if (self != null && self.Count > 1)
-                    throw new Exception(Strings.AmzCD.MultipleEntries(p, "/" + string.Join("/", curpath)));
+                    throw new UserInformationException(Strings.AmzCD.MultipleEntries(p, "/" + string.Join("/", curpath)));
                 else
                     parent = self.Data.First();
             }
@@ -234,11 +246,20 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
             
             throw new FileMissingException();
         }
+        
+        private static System.Text.RegularExpressions.Regex FILTERS_VALUE_ESCAPECHAR = new System.Text.RegularExpressions.Regex(@"[+\-&|!(){}\[\]^'""~*?:\\ ]", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        public static string EscapeFiltersValue(string value)
+        {
+            return FILTERS_VALUE_ESCAPECHAR.Replace(value, (m) => {
+                return @"\" + m.Value;
+            });
+        }
 
         #region IStreamingBackend implementation
         public void Put(string remotename, System.IO.Stream stream)
         {
-            m_waitUntil = DateTime.Now + m_delayTimeSpan;
+            EnforceConsistencyDelay();
 
             var overwrite = FileCache.ContainsKey(remotename);
             var fileid = overwrite ? m_filecache[remotename] : null;
@@ -281,20 +302,25 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
                 m_filecache = null;
                 throw;
             }
+            finally
+            {
+                m_waitUntil = DateTime.Now + m_delayTimeSpan;
+            }
         }
         public void Get(string remotename, System.IO.Stream stream)
         {
+            EnforceConsistencyDelay();
+
             using (var resp = m_oauth.GetResponse(string.Format("{0}/nodes/{1}/content", ContentUrl, GetFileID(remotename))))
-                Utility.Utility.CopyStream(resp.GetResponseStream(), stream);
+            using(var rs = Library.Utility.AsyncHttpRequest.TrySetTimeout(resp.GetResponseStream()))
+                Utility.Utility.CopyStream(rs, stream);
         }
         #endregion
 
         #region IBackend implementation
         public List<IFileEntry> List()
         {
-            var wait = m_waitUntil - DateTime.Now;
-            if (wait.Ticks > 0)
-                System.Threading.Thread.Sleep(wait);
+            EnforceConsistencyDelay();
 
             var query = string.Format("{0}/nodes?filters=parents:{1}&limit={2}", MetadataUrl, Utility.Uri.UrlEncode(CurrentDirectory.ID), PAGE_SIZE);
             var res = new List<IFileEntry>();
@@ -354,10 +380,10 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
         }
         public void Delete(string remotename)
         {
+            EnforceConsistencyDelay();
+
             try
             {
-                m_waitUntil = DateTime.Now + m_delayTimeSpan;
-
                 using(m_oauth.GetResponse(string.Format("{0}/trash/{1}", MetadataUrl, GetFileID(remotename)), null, "PUT"))
                 {
                 }
@@ -368,6 +394,7 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
             {
                 m_filecache = null;
             }
+            m_waitUntil = DateTime.Now + m_delayTimeSpan;
         }
         public void Test()
         {
@@ -421,6 +448,8 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
         #region IRenameEnabledBackend
         public void Rename(string oldname, string newname)
         {
+            EnforceConsistencyDelay();
+
             var id = GetFileID(oldname);
 
             var data = System.Text.Encoding.UTF8.GetBytes(
@@ -452,6 +481,10 @@ namespace Duplicati.Library.Backend.AmazonCloudDrive
             {
                 m_filecache = null;
                 throw;
+            }
+            finally
+            {
+                m_waitUntil = DateTime.Now + m_delayTimeSpan;
             }
         }
         #endregion
